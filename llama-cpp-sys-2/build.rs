@@ -207,6 +207,9 @@ fn main() {
 
     let (target_os, target_triple) =
         parse_target_os().unwrap_or_else(|t| panic!("Failed to parse target os {t}"));
+    #[cfg(feature = "blas")]
+    let target_arch =
+        std::env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH not set");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     let target_dir = get_cargo_target_dir().unwrap();
@@ -626,8 +629,67 @@ fn main() {
         if build_shared_libs { "ON" } else { "OFF" },
     );
 
-    if matches!(target_os, TargetOs::Apple(_)) {
-        config.define("GGML_BLAS", "OFF");
+    #[cfg(feature = "blas")]
+    {
+        config.define("GGML_BLAS", "ON");
+        if target_arch == "x86_64" && matches!(target_os, TargetOs::Linux) {
+            // Sequential, LP64 MKL — pairs with the Cargo feature default
+            // and matches FIPS/forking constraints elsewhere in aidb.
+            config.define("GGML_BLAS_VENDOR", "Intel10_64lp_seq");
+            config.define("BLA_VENDOR", "Intel10_64lp_seq");
+
+            // Discover MKL via intel-mkl-tool (0.8.1). API used:
+            //   - intel_mkl_tool::Config::from_str("mkl-static-lp64-seq") -> Result<Config>
+            //   - intel_mkl_tool::Library::new(cfg) -> Result<Library>
+            //   - Library::library_dir is a public PathBuf field pointing
+            //     at the directory holding libmkl_core.a; the install
+            //     prefix CMake expects in MKLROOT is its parent.
+            // Fall back to a user-set MKLROOT environment variable when
+            // intel-mkl-tool can't locate MKL on its own.
+            let mkl_root: Option<std::path::PathBuf> = (|| -> Option<std::path::PathBuf> {
+                use std::str::FromStr;
+                let cfg = intel_mkl_tool::Config::from_str("mkl-static-lp64-seq").ok()?;
+                let lib = intel_mkl_tool::Library::new(cfg).ok()?;
+                // library_dir is typically `<prefix>/lib` or `<prefix>/lib/intel64`;
+                // walk up to find a dir containing `include/` (the install prefix).
+                let mut prefix = lib.library_dir.clone();
+                for _ in 0..3 {
+                    if prefix.join("include").is_dir() {
+                        return Some(prefix);
+                    }
+                    if !prefix.pop() {
+                        break;
+                    }
+                }
+                // Fallback: include_dir's parent is the prefix in canonical layouts.
+                lib.include_dir.parent().map(std::path::Path::to_path_buf)
+            })()
+            .or_else(|| env::var_os("MKLROOT").map(std::path::PathBuf::from));
+
+            if let Some(root) = mkl_root {
+                println!("cargo:rerun-if-env-changed=MKLROOT");
+                config.define("MKLROOT", root.display().to_string());
+            } else {
+                println!(
+                    "cargo:warning=blas feature is on but MKL could not be located \
+                     via intel-mkl-tool or MKLROOT; CMake FindBLAS will likely fail"
+                );
+            }
+        } else if matches!(target_os, TargetOs::Apple(_)) {
+            config.define("GGML_BLAS_VENDOR", "Apple");
+        } else {
+            println!(
+                "cargo:warning=blas feature is enabled but no BLAS vendor is \
+                 configured for this target; building without BLAS"
+            );
+            config.define("GGML_BLAS", "OFF");
+        }
+    }
+    #[cfg(not(feature = "blas"))]
+    {
+        if matches!(target_os, TargetOs::Apple(_)) {
+            config.define("GGML_BLAS", "OFF");
+        }
     }
 
     if (matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc))
@@ -983,6 +1045,23 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=amdhip64");
         println!("cargo:rustc-link-lib=dylib=rocblas");
         println!("cargo:rustc-link-lib=dylib=hipblas");
+    }
+
+    #[cfg(feature = "blas")]
+    {
+        let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let target_os_str = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        if target_arch == "x86_64" && target_os_str == "linux" {
+            // Static MKL link order is fragile: lp64 -> sequential -> core
+            // -> pthread -> m -> dl. Matches the Intel link line advisor
+            // recommendation for the "Intel10_64lp_seq" vendor selected above.
+            println!("cargo:rustc-link-lib=static=mkl_intel_lp64");
+            println!("cargo:rustc-link-lib=static=mkl_sequential");
+            println!("cargo:rustc-link-lib=static=mkl_core");
+            println!("cargo:rustc-link-lib=dylib=pthread");
+            println!("cargo:rustc-link-lib=dylib=m");
+            println!("cargo:rustc-link-lib=dylib=dl");
+        }
     }
 
     // Link libraries
