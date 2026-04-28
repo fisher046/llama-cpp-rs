@@ -22,6 +22,60 @@ enum TargetOs {
     Android,
 }
 
+#[cfg(feature = "blas")]
+struct MklPaths {
+    /// Install prefix — the dir containing both `include/` and `lib/`.
+    /// Passed to CMake as MKLROOT (via env, not -D) so FindBLAS can locate the libs.
+    prefix: PathBuf,
+    /// Lib dir — the dir containing libmkl_*.{a,so}.
+    /// Emitted as cargo:rustc-link-search=native=...
+    lib_dir: PathBuf,
+}
+
+#[cfg(feature = "blas")]
+fn discover_mkl(target_arch: &str, target_os: &TargetOs) -> Option<MklPaths> {
+    if target_arch != "x86_64" || !matches!(target_os, TargetOs::Linux) {
+        return None;
+    }
+    println!("cargo:rerun-if-env-changed=MKLROOT");
+
+    // Try intel-mkl-tool first.
+    use std::str::FromStr;
+    if let Ok(cfg) = intel_mkl_tool::Config::from_str("mkl-static-lp64-seq") {
+        if let Ok(lib) = intel_mkl_tool::Library::new(cfg) {
+            // library_dir is typically `<prefix>/lib` or `<prefix>/lib/intel64`;
+            // walk up to find a dir containing `include/` (the install prefix).
+            let mut prefix = lib.library_dir.clone();
+            for _ in 0..3 {
+                if prefix.join("include").is_dir() {
+                    return Some(MklPaths {
+                        prefix,
+                        lib_dir: lib.library_dir,
+                    });
+                }
+                if !prefix.pop() {
+                    break;
+                }
+            }
+            // Fallback: include_dir's parent is the prefix in canonical layouts.
+            if let Some(p) = lib.include_dir.parent() {
+                return Some(MklPaths {
+                    prefix: p.to_path_buf(),
+                    lib_dir: lib.library_dir,
+                });
+            }
+        }
+    }
+
+    // Fallback: user-set MKLROOT env var. Assume layout <root>/lib.
+    if let Some(root) = std::env::var_os("MKLROOT").map(PathBuf::from) {
+        let lib_dir = root.join("lib");
+        return Some(MklPaths { prefix: root, lib_dir });
+    }
+
+    None
+}
+
 macro_rules! debug_log {
     ($($arg:tt)*) => {
         if std::env::var("BUILD_DEBUG").is_ok() {
@@ -210,6 +264,25 @@ fn main() {
     #[cfg(feature = "blas")]
     let target_arch =
         std::env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH not set");
+
+    // Discover MKL once up-front so the cmake config block and the rustc
+    // link block both consume the same paths. Panic early if discovery
+    // fails on Linux x86_64 (where blas requires MKL).
+    #[cfg(feature = "blas")]
+    let mkl_paths: Option<MklPaths> = discover_mkl(&target_arch, &target_os);
+    #[cfg(feature = "blas")]
+    if target_arch == "x86_64"
+        && matches!(target_os, TargetOs::Linux)
+        && mkl_paths.is_none()
+    {
+        panic!(
+            "blas feature is on but MKL could not be located via \
+             intel-mkl-tool or MKLROOT. Either install MKL such that \
+             intel-mkl-tool can find it (`intel-mkl-tool list`) or set \
+             the MKLROOT environment variable to the install prefix."
+        );
+    }
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     let target_dir = get_cargo_target_dir().unwrap();
@@ -638,46 +711,13 @@ fn main() {
             config.define("GGML_BLAS_VENDOR", "Intel10_64lp_seq");
             config.define("BLA_VENDOR", "Intel10_64lp_seq");
 
-            // Discover MKL via intel-mkl-tool (0.8.1). API used:
-            //   - intel_mkl_tool::Config::from_str("mkl-static-lp64-seq") -> Result<Config>
-            //   - intel_mkl_tool::Library::new(cfg) -> Result<Library>
-            //   - Library::library_dir is a public PathBuf field pointing
-            //     at the directory holding libmkl_core.a; the install
-            //     prefix CMake expects in MKLROOT is its parent.
-            // Fall back to a user-set MKLROOT environment variable when
-            // intel-mkl-tool can't locate MKL on its own.
-            // Re-run whenever MKLROOT is set/unset so the discovery is
-            // re-evaluated, not only after a successful discovery.
-            println!("cargo:rerun-if-env-changed=MKLROOT");
-            let mkl_root: Option<std::path::PathBuf> = (|| -> Option<std::path::PathBuf> {
-                use std::str::FromStr;
-                let cfg = intel_mkl_tool::Config::from_str("mkl-static-lp64-seq").ok()?;
-                let lib = intel_mkl_tool::Library::new(cfg).ok()?;
-                // library_dir is typically `<prefix>/lib` or `<prefix>/lib/intel64`;
-                // walk up to find a dir containing `include/` (the install prefix).
-                let mut prefix = lib.library_dir.clone();
-                for _ in 0..3 {
-                    if prefix.join("include").is_dir() {
-                        return Some(prefix);
-                    }
-                    if !prefix.pop() {
-                        break;
-                    }
-                }
-                // Fallback: include_dir's parent is the prefix in canonical layouts.
-                lib.include_dir.parent().map(std::path::Path::to_path_buf)
-            })()
-            .or_else(|| env::var_os("MKLROOT").map(std::path::PathBuf::from));
-
-            let root = mkl_root.unwrap_or_else(|| {
-                panic!(
-                    "blas feature is on but MKL could not be located via \
-                     intel-mkl-tool or MKLROOT. Either install MKL such that \
-                     intel-mkl-tool can find it (`intel-mkl-tool list`) or set \
-                     the MKLROOT environment variable to the install prefix."
-                )
-            });
-            config.define("MKLROOT", root.display().to_string());
+            // CMake's FindBLAS reads MKLROOT from the *environment*, not
+            // from -D cache variables, so propagate it via config.env(...).
+            // We also keep config.define for backward-compat with any
+            // CMake code that reads it as a cache var.
+            let paths = mkl_paths.as_ref().expect("checked above");
+            config.env("MKLROOT", paths.prefix.display().to_string());
+            config.define("MKLROOT", paths.prefix.display().to_string());
         } else if matches!(target_os, TargetOs::Apple(_)) {
             config.define("GGML_BLAS_VENDOR", "Apple");
             // TODO: ggml's CMake may also require GGML_ACCELERATE=ON; verify
@@ -1055,6 +1095,14 @@ fn main() {
     #[cfg(feature = "blas")]
     {
         if target_arch == "x86_64" && matches!(target_os, TargetOs::Linux) {
+            let paths = mkl_paths.as_ref().expect("checked above");
+            // rustc has the -l directives for mkl_* but no -L path unless
+            // we emit it here; the cmake build does not bubble MKL's lib
+            // dir up to rustc on its own.
+            println!(
+                "cargo:rustc-link-search=native={}",
+                paths.lib_dir.display()
+            );
             // Static MKL link order is fragile: lp64 -> sequential -> core
             // -> pthread -> m -> dl. Matches the Intel link line advisor
             // recommendation for the "Intel10_64lp_seq" vendor selected above.
