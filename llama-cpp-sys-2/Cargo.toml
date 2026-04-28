@@ -80,6 +80,7 @@ cmake = "0.1"
 find_cuda_helper = "0.2.0"
 glob = "0.3.3"
 walkdir = "2"
+intel-mkl-tool = { version = "0.8", optional = true }
 
 [features]
 cuda = []
@@ -96,3 +97,4 @@ static-stdcxx = []
 system-ggml = []
 system-ggml-static = ["system-ggml"]
 mtmd = []
+blas = ["dep:intel-mkl-tool"]
