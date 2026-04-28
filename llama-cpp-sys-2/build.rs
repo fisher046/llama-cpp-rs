@@ -67,10 +67,20 @@ fn discover_mkl(target_arch: &str, target_os: &TargetOs) -> Option<MklPaths> {
         }
     }
 
-    // Fallback: user-set MKLROOT env var. Assume layout <root>/lib.
+    // Fallback: user-set MKLROOT env var.
     if let Some(root) = std::env::var_os("MKLROOT").map(PathBuf::from) {
-        let lib_dir = root.join("lib");
-        return Some(MklPaths { prefix: root, lib_dir });
+        // Intel oneAPI's canonical layout is <root>/lib/intel64; older / flat
+        // installs use <root>/lib. Probe both.
+        for candidate in ["lib/intel64", "lib"] {
+            let lib_dir = root.join(candidate);
+            if lib_dir.join("libmkl_core.a").exists()
+                || lib_dir.join("libmkl_core.so").exists()
+            {
+                return Some(MklPaths { prefix: root, lib_dir });
+            }
+        }
+        // MKLROOT is set but neither lib layout has libmkl_core. Don't return
+        // a bogus path — fall through to the panic so the user gets a clear error.
     }
 
     None
@@ -713,11 +723,8 @@ fn main() {
 
             // CMake's FindBLAS reads MKLROOT from the *environment*, not
             // from -D cache variables, so propagate it via config.env(...).
-            // We also keep config.define for backward-compat with any
-            // CMake code that reads it as a cache var.
             let paths = mkl_paths.as_ref().expect("checked above");
             config.env("MKLROOT", paths.prefix.display().to_string());
-            config.define("MKLROOT", paths.prefix.display().to_string());
         } else if matches!(target_os, TargetOs::Apple(_)) {
             config.define("GGML_BLAS_VENDOR", "Apple");
             // TODO: ggml's CMake may also require GGML_ACCELERATE=ON; verify
