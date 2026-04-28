@@ -646,6 +646,9 @@ fn main() {
             //     prefix CMake expects in MKLROOT is its parent.
             // Fall back to a user-set MKLROOT environment variable when
             // intel-mkl-tool can't locate MKL on its own.
+            // Re-run whenever MKLROOT is set/unset so the discovery is
+            // re-evaluated, not only after a successful discovery.
+            println!("cargo:rerun-if-env-changed=MKLROOT");
             let mkl_root: Option<std::path::PathBuf> = (|| -> Option<std::path::PathBuf> {
                 use std::str::FromStr;
                 let cfg = intel_mkl_tool::Config::from_str("mkl-static-lp64-seq").ok()?;
@@ -666,17 +669,19 @@ fn main() {
             })()
             .or_else(|| env::var_os("MKLROOT").map(std::path::PathBuf::from));
 
-            if let Some(root) = mkl_root {
-                println!("cargo:rerun-if-env-changed=MKLROOT");
-                config.define("MKLROOT", root.display().to_string());
-            } else {
-                println!(
-                    "cargo:warning=blas feature is on but MKL could not be located \
-                     via intel-mkl-tool or MKLROOT; CMake FindBLAS will likely fail"
-                );
-            }
+            let root = mkl_root.unwrap_or_else(|| {
+                panic!(
+                    "blas feature is on but MKL could not be located via \
+                     intel-mkl-tool or MKLROOT. Either install MKL such that \
+                     intel-mkl-tool can find it (`intel-mkl-tool list`) or set \
+                     the MKLROOT environment variable to the install prefix."
+                )
+            });
+            config.define("MKLROOT", root.display().to_string());
         } else if matches!(target_os, TargetOs::Apple(_)) {
             config.define("GGML_BLAS_VENDOR", "Apple");
+            // TODO: ggml's CMake may also require GGML_ACCELERATE=ON; verify
+            // on macOS and add if needed before merging.
         } else {
             println!(
                 "cargo:warning=blas feature is enabled but no BLAS vendor is \
@@ -1049,9 +1054,7 @@ fn main() {
 
     #[cfg(feature = "blas")]
     {
-        let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-        let target_os_str = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-        if target_arch == "x86_64" && target_os_str == "linux" {
+        if target_arch == "x86_64" && matches!(target_os, TargetOs::Linux) {
             // Static MKL link order is fragile: lp64 -> sequential -> core
             // -> pthread -> m -> dl. Matches the Intel link line advisor
             // recommendation for the "Intel10_64lp_seq" vendor selected above.
