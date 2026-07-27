@@ -8,6 +8,12 @@ use cmake::Config;
 use glob::glob;
 use walkdir::DirEntry;
 
+// `static-mkl` links Intel's OpenMP runtime (`libiomp5`) for MKL threading, while
+// `openmp` links GNU OpenMP (`libgomp`) for ggml. Two OpenMP runtimes in one binary
+// abort at runtime with `OMP: Error #15`, so the features are mutually exclusive.
+#[cfg(all(feature = "static-mkl", feature = "openmp"))]
+compile_error!("features `static-mkl` and `openmp` (or `static-openmp`) are mutually exclusive.");
+
 enum WindowsVariant {
     Msvc,
     Other,
@@ -946,6 +952,12 @@ fn main() {
         );
         config.define("GGML_BLAS", "ON");
         config.define("GGML_BLAS_VENDOR", "Intel10_64lp");
+        // With `static-mkl`, tell CMake's FindBLAS to resolve the static MKL
+        // archives (libmkl_*.a) rather than the single dynamic runtime
+        // (libmkl_rt.so). The actual static link line is emitted further below.
+        if cfg!(feature = "static-mkl") {
+            config.define("BLA_STATIC", "ON");
+        }
     }
 
     // Android doesn't have OpenMP support AFAICT and openmp is a default feature. Do this here
@@ -1161,7 +1173,33 @@ fn main() {
             "No MKL library directory found under MKLROOT={mkl_root}"
         );
 
-        println!("cargo:rustc-link-lib=dylib=mkl_rt");
+        if cfg!(feature = "static-mkl") {
+            // Statically link the MKL archives (only the Intel OpenMP runtime
+            // `libiomp5`, linked dynamically below).
+            println!("cargo:rustc-link-lib=static=mkl_intel_lp64");
+            println!("cargo:rustc-link-lib=static=mkl_intel_thread");
+            println!("cargo:rustc-link-lib=static=mkl_core");
+
+            // Intel OpenMP runtime (dynamic; there is normally no static libiomp5).
+            println!("cargo:rerun-if-env-changed=MKL_IOMP5_DIR");
+            if let Ok(dir) = env::var("MKL_IOMP5_DIR") {
+                println!("cargo:rustc-link-search=native={dir}");
+            }
+            for rel in [
+                "../compiler/lib/intel64",
+                "../../compiler/latest/linux/compiler/lib/intel64_lin",
+            ] {
+                let dir = Path::new(&mkl_root).join(rel);
+                if dir.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", dir.display());
+                }
+            }
+            println!("cargo:rustc-link-lib=iomp5");
+        } else {
+            // Default: link the single MKL dynamic runtime. Requires the MKL shared
+            // libraries to be present on the machine at run time.
+            println!("cargo:rustc-link-lib=dylib=mkl_rt");
+        }
     }
 
     // Link libraries

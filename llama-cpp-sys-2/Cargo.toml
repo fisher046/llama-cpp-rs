@@ -101,6 +101,11 @@ vulkan = []
 opencl = []
 # Build the BLAS backend with Intel MKL (x86_64-only; requires MKLROOT set).
 mkl = []
+# Link Intel MKL statically on x86_64 targets. This is useful for downstreams that
+# ship self-contained binaries while keeping the MKL BLAS backend enabled.
+# Mutually exclusive with `openmp`/`static-openmp` (it supplies Intel `libiomp5`,
+# not GNU `libgomp`); enabling both is a compile error.
+static-mkl = ["mkl"]
 openmp = []
 # Link GNU OpenMP (`libgomp`) statically on GNU targets. This is useful for
 # downstreams that ship self-contained binaries while keeping OpenMP enabled.

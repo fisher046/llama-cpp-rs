@@ -41,6 +41,13 @@ openmp = ["llama-cpp-sys-2/openmp"]
 static-openmp = ["llama-cpp-sys-2/static-openmp"]
 rocm = ["llama-cpp-sys-2/rocm"]
 mkl = ["llama-cpp-sys-2/mkl"]
+# Link Intel MKL statically on x86_64 targets while keeping the MKL BLAS backend
+# enabled. Useful for self-contained downstream binaries (no MKL runtime
+# dependency, only a dynamic `libiomp5`).
+# Mutually exclusive with `openmp`/`static-openmp` (enabling both is a compile
+# error) — note `openmp` is in the default feature set, so use with
+# `default-features = false`.
+static-mkl = ["mkl", "llama-cpp-sys-2/static-mkl"]
 sampler = []
 # Only has an impact on Android.
 android-shared-stdcxx = ["llama-cpp-sys-2/shared-stdcxx"]
